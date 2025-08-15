@@ -13,9 +13,15 @@
 (define-constant err-achievement-already-earned (err u111))
 (define-constant err-invalid-achievement-type (err u112))
 (define-constant err-insufficient-achievements (err u113))
+(define-constant err-sponsor-not-found (err u114))
+(define-constant err-invalid-sponsor-tier (err u115))
+(define-constant err-insufficient-sponsorship (err u116))
+(define-constant err-sponsorship-exists (err u117))
+(define-constant err-invalid-revenue-share (err u118))
 
 (define-data-var tournament-counter uint u0)
 (define-data-var achievement-counter uint u0)
+(define-data-var sponsor-counter uint u0)
 
 (define-map tournaments uint {
     name: (string-ascii 50),
@@ -71,6 +77,35 @@
     rarity: (string-ascii 20)
 })
 
+;; Sponsorship system data maps
+(define-map sponsors uint {
+    name: (string-ascii 50),
+    company: (string-ascii 100),
+    contact-info: (string-ascii 200),
+    sponsor-tier: (string-ascii 20),
+    total-contributed: uint,
+    tournaments-sponsored: uint,
+    revenue-share-percentage: uint,
+    active: bool,
+    created-at: uint
+})
+
+(define-map tournament-sponsorships {tournament-id: uint, sponsor-id: uint} {
+    contribution-amount: uint,
+    revenue-share-earned: uint,
+    sponsored-at: uint,
+    benefits-claimed: bool
+})
+
+(define-map sponsor-tournament-list uint (list 50 uint))
+
+(define-map sponsor-tier-benefits (string-ascii 20) {
+    min-contribution: uint,
+    revenue-share-percentage: uint,
+    max-tournaments-per-month: uint,
+    priority-placement: bool
+})
+
 (define-read-only (get-tournament (tournament-id uint))
     (map-get? tournaments tournament-id)
 )
@@ -117,6 +152,27 @@
 
 (define-read-only (get-achievement-nft-metadata (token-id uint))
     (map-get? achievement-nft-metadata token-id)
+)
+
+;; Sponsorship read-only functions
+(define-read-only (get-sponsor (sponsor-id uint))
+    (map-get? sponsors sponsor-id)
+)
+
+(define-read-only (get-tournament-sponsorship (tournament-id uint) (sponsor-id uint))
+    (map-get? tournament-sponsorships {tournament-id: tournament-id, sponsor-id: sponsor-id})
+)
+
+(define-read-only (get-sponsor-tournaments (sponsor-id uint))
+    (default-to (list) (map-get? sponsor-tournament-list sponsor-id))
+)
+
+(define-read-only (get-sponsor-tier-benefits (tier (string-ascii 20)))
+    (map-get? sponsor-tier-benefits tier)
+)
+
+(define-read-only (get-sponsor-counter)
+    (var-get sponsor-counter)
 )
 
 (define-public (create-tournament (name (string-ascii 50)) (entry-fee uint) (max-participants uint))
@@ -435,3 +491,200 @@
         )
     )
 )
+
+;; Sponsorship system functions
+(define-public (create-sponsor-tier (tier (string-ascii 20)) (min-contribution uint) (revenue-share uint) (max-tournaments uint) (priority bool))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= revenue-share u100) err-invalid-revenue-share)
+        (map-set sponsor-tier-benefits tier {
+            min-contribution: min-contribution,
+            revenue-share-percentage: revenue-share,
+            max-tournaments-per-month: max-tournaments,
+            priority-placement: priority
+        })
+        (ok true)
+    )
+)
+
+(define-public (register-sponsor (name (string-ascii 50)) (company (string-ascii 100)) (contact-info (string-ascii 200)) (tier (string-ascii 20)))
+    (let (
+        (sponsor-id (+ (var-get sponsor-counter) u1))
+        (tier-benefits (unwrap! (get-sponsor-tier-benefits tier) err-invalid-sponsor-tier))
+        (revenue-share (get revenue-share-percentage tier-benefits))
+    )
+        (map-set sponsors sponsor-id {
+            name: name,
+            company: company,
+            contact-info: contact-info,
+            sponsor-tier: tier,
+            total-contributed: u0,
+            tournaments-sponsored: u0,
+            revenue-share-percentage: revenue-share,
+            active: true,
+            created-at: stacks-block-height
+        })
+        (var-set sponsor-counter sponsor-id)
+        (ok sponsor-id)
+    )
+)
+
+(define-public (sponsor-tournament (tournament-id uint) (sponsor-id uint) (contribution-amount uint))
+    (let (
+        (tournament (unwrap! (get-tournament tournament-id) err-not-found))
+        (sponsor (unwrap! (get-sponsor sponsor-id) err-sponsor-not-found))
+        (tier-benefits (unwrap! (get-sponsor-tier-benefits (get sponsor-tier sponsor)) err-invalid-sponsor-tier))
+        (existing-sponsorship (get-tournament-sponsorship tournament-id sponsor-id))
+        (min-contribution (get min-contribution tier-benefits))
+        (current-tournaments (get-sponsor-tournaments sponsor-id))
+    )
+        ;; Validate sponsor is active and contribution meets minimum
+        (asserts! (get active sponsor) err-sponsor-not-found)
+        (asserts! (>= contribution-amount min-contribution) err-insufficient-sponsorship)
+        (asserts! (is-none existing-sponsorship) err-sponsorship-exists)
+        (asserts! (or (is-eq (get status tournament) "open") (is-eq (get status tournament) "active")) err-tournament-started)
+        
+        ;; Transfer sponsorship funds to contract
+        (try! (stx-transfer? contribution-amount tx-sender (as-contract tx-sender)))
+        
+        ;; Update tournament prize pool
+        (map-set tournaments tournament-id (merge tournament {
+            prize-pool: (+ (get prize-pool tournament) contribution-amount)
+        }))
+        
+        ;; Record sponsorship
+        (map-set tournament-sponsorships {tournament-id: tournament-id, sponsor-id: sponsor-id} {
+            contribution-amount: contribution-amount,
+            revenue-share-earned: u0,
+            sponsored-at: stacks-block-height,
+            benefits-claimed: false
+        })
+        
+        ;; Update sponsor stats
+        (map-set sponsors sponsor-id (merge sponsor {
+            total-contributed: (+ (get total-contributed sponsor) contribution-amount),
+            tournaments-sponsored: (+ (get tournaments-sponsored sponsor) u1)
+        }))
+        
+        ;; Add tournament to sponsor's list
+        (map-set sponsor-tournament-list sponsor-id 
+            (unwrap! (as-max-len? (append current-tournaments tournament-id) u50) err-tournament-full)
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (distribute-sponsor-revenue (tournament-id uint) (sponsor-id uint))
+    (let (
+        (tournament (unwrap! (get-tournament tournament-id) err-not-found))
+        (sponsor (unwrap! (get-sponsor sponsor-id) err-sponsor-not-found))
+        (sponsorship (unwrap! (get-tournament-sponsorship tournament-id sponsor-id) err-sponsor-not-found))
+        (prize-pool (get prize-pool tournament))
+        (contribution (get contribution-amount sponsorship))
+        (revenue-share-percentage (get revenue-share-percentage sponsor))
+        (revenue-earned (/ (* prize-pool revenue-share-percentage) u100))
+    )
+        ;; Only distribute revenue after tournament completion
+        (asserts! (is-eq (get status tournament) "completed") err-invalid-status)
+        (asserts! (not (get benefits-claimed sponsorship)) err-already-finalized)
+        
+        ;; Transfer revenue share to sponsor
+        (try! (as-contract (stx-transfer? revenue-earned tx-sender tx-sender)))
+        
+        ;; Update sponsorship record
+        (map-set tournament-sponsorships {tournament-id: tournament-id, sponsor-id: sponsor-id} 
+            (merge sponsorship {
+                revenue-share-earned: revenue-earned,
+                benefits-claimed: true
+            })
+        )
+        
+        (ok revenue-earned)
+    )
+)
+
+(define-public (update-sponsor-tier (sponsor-id uint) (new-tier (string-ascii 20)))
+    (let (
+        (sponsor (unwrap! (get-sponsor sponsor-id) err-sponsor-not-found))
+        (tier-benefits (unwrap! (get-sponsor-tier-benefits new-tier) err-invalid-sponsor-tier))
+        (new-revenue-share (get revenue-share-percentage tier-benefits))
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set sponsors sponsor-id (merge sponsor {
+            sponsor-tier: new-tier,
+            revenue-share-percentage: new-revenue-share
+        }))
+        (ok true)
+    )
+)
+
+(define-public (deactivate-sponsor (sponsor-id uint))
+    (let (
+        (sponsor (unwrap! (get-sponsor sponsor-id) err-sponsor-not-found))
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set sponsors sponsor-id (merge sponsor {
+            active: false
+        }))
+        (ok true)
+    )
+)
+
+;; Read-only functions for sponsor analytics
+(define-read-only (get-tournament-total-sponsorship (tournament-id uint))
+    (let (
+        (tournament (get-tournament tournament-id))
+    )
+        (match tournament
+            tournament-data (ok (get prize-pool tournament-data))
+            err-not-found
+        )
+    )
+)
+
+(define-read-only (get-sponsor-revenue-earned (sponsor-id uint))
+    (let (
+        (sponsor (get-sponsor sponsor-id))
+        (sponsor-tournaments (get-sponsor-tournaments sponsor-id))
+    )
+        (match sponsor
+            sponsor-data (ok {
+                total-contributed: (get total-contributed sponsor-data),
+                tournaments-sponsored: (get tournaments-sponsored sponsor-data),
+                active: (get active sponsor-data)
+            })
+            err-sponsor-not-found
+        )
+    )
+)
+
+(define-read-only (calculate-potential-revenue (tournament-id uint) (sponsor-id uint))
+    (let (
+        (tournament (get-tournament tournament-id))
+        (sponsor (get-sponsor sponsor-id))
+    )
+        (match tournament
+            tournament-data
+            (match sponsor
+                sponsor-data
+                (let (
+                    (prize-pool (get prize-pool tournament-data))
+                    (revenue-share (get revenue-share-percentage sponsor-data))
+                    (potential-revenue (/ (* prize-pool revenue-share) u100))
+                )
+                    (ok potential-revenue)
+                )
+                err-sponsor-not-found
+            )
+            err-not-found
+        )
+    )
+)
+
+(define-read-only (get-active-sponsors)
+    (ok (var-get sponsor-counter))
+)
+
+
+
